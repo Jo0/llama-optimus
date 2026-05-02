@@ -534,8 +534,14 @@ def run_optimization(n_trials, n_tokens, metric, repeat, llama_bench_path, model
     print(f"{llama_bench_cmd}")
     print("")
 
-    # launch optimized bench
-    subprocess.run(shlex.split(llama_bench_cmd), check=True)
+    # launch optimized bench (stream output through print so it reaches the log file)
+    proc = subprocess.Popen(shlex.split(llama_bench_cmd, posix=False),
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+    proc.wait()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, llama_bench_cmd)
 
 
     print("")
@@ -552,7 +558,13 @@ def run_optimization(n_trials, n_tokens, metric, repeat, llama_bench_path, model
     print("")
 
     # launch non-optimized (default) bench
-    subprocess.run(shlex.split(llama_bench_cmd_default), check=True)
+    proc = subprocess.Popen(shlex.split(llama_bench_cmd_default, posix=False),
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+    proc.wait()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, llama_bench_cmd_default)
 
     # [TBD] add % of improvement 
 
