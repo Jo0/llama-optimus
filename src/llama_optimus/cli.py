@@ -2,13 +2,27 @@
 # handle parsing, validation, and env setup
 
 import argparse, os, sys
-import platform 
-from pathlib import Path   
+import platform
+import logging
+from datetime import datetime
+from pathlib import Path
 from .core import run_optimization, estimate_max_ngl, warmup_until_stable
-from .override_patterns import OVERRIDE_PATTERNS   
-from .search_space import SEARCH_SPACE, max_threads 
+from .override_patterns import OVERRIDE_PATTERNS
+from .search_space import SEARCH_SPACE, max_threads
 
 from llama_optimus import __version__
+
+
+class _Tee:
+    """Write to multiple streams at once (terminal + log file)."""
+    def __init__(self, *streams):
+        self.streams = streams
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+    def flush(self):
+        for s in self.streams:
+            s.flush()
 
 
 def main():
@@ -72,10 +86,18 @@ def main():
 
     # Check the operating system and build llama_bench_path
     if platform.system() == "Windows":
-        llama_bench_path = f"{llama_bin_path}/Release/llama-bench.exe"
-        # Sanity-check
+        # Check CMake build Release/ directory first, then flat directory for prebuilt binaries from Github or WinGet
+        llama_bench_path = f"{llama_bin_path}/llama-bench.exe"
+
         if not Path(llama_bench_path).is_file():
-            sys.exit(f"ERROR: llama-bench.exe not found at {llama_bench_path}")
+            llama_bench_path = f"{llama_bin_path}/Release/llama-bench.exe"
+        if not Path(llama_bench_path).is_file():
+            sys.exit(
+                f"ERROR: llama-bench.exe not found.\n"
+                f"  Searched:\n"
+                f"    {llama_bin_path}/llama-bench.exe\n"
+                f"    {llama_bin_path}/Release/llama-bench.exe"
+            )
     else:
         llama_bench_path = f"{llama_bin_path}/llama-bench"
         # Sanity-check
@@ -100,6 +122,23 @@ def main():
         print(f"ERROR: llama-bench not found at {llama_bench_path}. ...", file=sys.stderr)
         sys.exit(1)
 
+    # Set up log file: logs/<timestamp>_<model_stem>.log
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    model_stem = Path(model_path).stem[:60]
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_path = log_dir / f"llama_optimus_{timestamp}_{model_stem}.log"
+    _log_file = open(log_path, "w", encoding="utf-8", buffering=1)
+
+    # Tee stdout so all print() calls go to both terminal and log file
+    sys.stdout = _Tee(sys.__stdout__, _log_file)
+
+    # Add a file handler to the root logger so Optuna's trial logs are also captured
+    _file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    _file_handler.setFormatter(logging.Formatter("%(message)s"))
+    logging.getLogger().addHandler(_file_handler)
+
+    print(f"Logging to: {log_path}")
     print("")
     print("#################")
     print("# LLAMA-OPTIMUS #")
