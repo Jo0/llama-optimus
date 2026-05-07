@@ -1,0 +1,12 @@
+# Virtual Environment Configuration
+# This file is read by Roo on every session for this workspace.
+
+## Python Virtual Environment
+- A Python virtual environment exists at `.venv/` in the workspace root.
+- **Always** activate the venv before running any Python commands (`python`, `pytest`, `pip`, etc.).
+- Activation commands by shell:
+  - **cmd.exe** (default): `call .venv\Scripts\activate.bat`
+  - **PowerShell**: `.\.venv\Scripts\Activate.ps1`
+  - When chaining with `&&` in cmd.exe: `.\.venv\Scripts\activate.bat && python <command>`
+- After activation, verify with `python --version` and `pip list` to confirm packages from the venv are available.
+- The project dependencies are defined in `pyproject.toml` and `requirements.txt`.

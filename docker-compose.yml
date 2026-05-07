@@ -1,0 +1,66 @@
+# =============================================================================
+# llama-optimus docker-compose
+# =============================================================================
+# Convenience file for local development and testing.
+#
+# Quick start (CUDA 13):
+#   docker compose run optimus --model /models/my-model.gguf --trials 45 --metric tg
+#
+# Quick test:
+#   docker compose run optimus --model /models/my-model.gguf --trials 5 -r 1 --no-warmup --n-tokens 20 --metric tg
+#
+# Customize by editing the environment section or passing overrides:
+#   docker compose run -e TRIALS=100 optimus --model /models/my-model.gguf --metric tg
+# =============================================================================
+
+services:
+  optimus:
+    image: llama-optimus-cuda13
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Change this to switch GPU backend:
+        #   full-cuda13  -> NVIDIA CUDA 13 (default)
+        #   full-cuda     -> NVIDIA CUDA 12
+        #   full-rocm     -> AMD ROCm
+        #   full-vulkan   -> Vulkan
+        #   full          -> CPU-only
+        BASE_IMAGE: ghcr.io/ggml-org/llama.cpp:full-cuda13
+
+    # GPU access (NVIDIA)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+
+    # Volume mounts
+    volumes:
+      # Models directory - mount your GGUF models here
+      # Change the host path to match your model storage location
+      - ./models:/models:ro
+
+      # Output directory - results, logs, config files
+      - ./output:/app/output
+
+      # HuggingFace cache - avoids re-downloading models
+      - ${HF_CACHE_DIR:-~/.cache/huggingface}:${HF_HOME:-/root/.cache/huggingface}
+
+    # Environment variables
+    environment:
+      # Path to llama.cpp binaries inside the container
+      - LLAMA_BIN=/opt/llama.cpp/build/bin
+      # HuggingFace cache directory
+      - HF_HOME=/root/.cache/huggingface
+      # Unbuffered Python output for docker logs
+      - PYTHONUNBUFFERED=1
+
+    # Default command (override by passing arguments to `docker compose run`)
+    entrypoint: ["python3", "optimus.py"]
+    command: ["--help"]
+
+    # Resource limits (optional - adjust for your hardware)
+    # mem_limit: 32g
+    # memswap_limit: 32g

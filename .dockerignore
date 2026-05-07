@@ -1,0 +1,73 @@
+# -------------------------------------------------------------------
+# .dockerignore
+# -------------------------------------------------------------------
+# Exclude host artifacts from the Docker build context to keep builds
+# fast and images small.
+# -------------------------------------------------------------------
+
+# Version control
+.git/
+.gitignore
+
+# Python virtual environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+*.egg
+.eggs/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs and output
+logs/
+*.log
+best_phase1_config.json
+*.csv
+
+# Documentation (not needed inside container)
+docs/
+*.md
+!README.md
+
+# Assets (logos, screenshots)
+assets/
+
+# Test files (optional - remove if you want tests in container)
+test/
+
+# Docker files themselves (avoid recursive context)
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Local configuration / helper scripts
+activate_env.sh
+set_local_paths.sh
+
+# Data / models (mounted as volumes instead)
+models/
+*.gguf
+*.bin
+
+# Roo config
+.roo/
