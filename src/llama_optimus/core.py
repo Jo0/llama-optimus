@@ -1,18 +1,86 @@
 # core.py
 # Core functions for llama-optimus optimization
 
+import json
 import re
 import optuna
 import os
 import shutil
-import pandas as pd 
+import pandas as pd
 import tempfile
 import subprocess
 import shlex
+import time
 from optuna.samplers import TPESampler
 from optuna.samplers import GridSampler
 from .override_patterns import OVERRIDE_PATTERNS   
-from .search_space import SEARCH_SPACE, max_threads 
+from .search_space import SEARCH_SPACE, max_threads, get_context_aware_batch_high
+from .hardware_probe import get_gpu_telemetry, penalize_vram_heavy
+
+
+def _progress_callback(stage_name, total_trials):
+    """Create an Optuna callback that prints progress with ETA.
+
+    Returns a callback(study, trial) that tracks elapsed time, computes
+    a running average per-trial duration, and prints an ETA after each
+    trial completes.
+    """
+    start_time = time.time()
+
+    def callback(study, trial):
+        elapsed = time.time() - start_time
+        completed = trial.number + 1
+        avg_time = elapsed / completed
+        remaining = total_trials - completed
+        eta_seconds = remaining * avg_time
+        eta_min = int(eta_seconds // 60)
+        eta_sec = int(eta_seconds % 60)
+        pct = completed / total_trials * 100
+        print(f"[{stage_name}] Trial {completed}/{total_trials} "
+              f"({pct:.1f}%) - avg {avg_time:.1f}s/trial - "
+              f"ETA: {eta_min}m {eta_sec}s")
+
+    return callback
+
+
+def _print_stage_estimate(stage_name, total_trials, avg_seconds_per_trial=25):
+    """Print an upfront estimate of trial count and total runtime."""
+    total_seconds = total_trials * avg_seconds_per_trial
+    total_min = int(total_seconds // 60)
+    total_sec = int(total_seconds % 60)
+    print(f"  Trials: {total_trials}")
+    print(f"  Estimated runtime: ~{total_min}m {total_sec}s "
+          f"(assuming ~{avg_seconds_per_trial}s/trial)")
+    print("")
+
+
+def _run_with_telemetry(objective_fn, trial, *, vram_headroom_threshold=0.12,
+                        no_telemetry=False, **kwargs) -> float:
+    """Wrapper that captures pre/post telemetry and applies VRAM penalization.
+
+    Applied around all three objective functions so the optimizer learns to
+    avoid VRAM-heavy configurations that cause Windows paging.
+    """
+    pre_snap = get_gpu_telemetry() if not no_telemetry else None
+    tokens_per_sec = objective_fn(trial, **kwargs)
+
+    post_snap = get_gpu_telemetry() if not no_telemetry else None
+    if post_snap:
+        tokens_per_sec, reason = penalize_vram_heavy(
+            tokens_per_sec, post_snap, vram_headroom_threshold
+        )
+        trial.set_user_attr("vram_used_mb", post_snap.vram_used_mb)
+        trial.set_user_attr("vram_total_mb", post_snap.vram_total_mb)
+        trial.set_user_attr("vram_headroom_pct", post_snap.vram_headroom_pct)
+        trial.set_user_attr("gpu_temp", post_snap.temperature_c)
+        trial.set_user_attr("gpu_util_pct", post_snap.gpu_utilization_pct)
+        trial.set_user_attr("vram_penalty_reason", reason)
+    elif no_telemetry:
+        trial.set_user_attr("vram_penalty_reason", "telemetry-disabled")
+    else:
+        trial.set_user_attr("vram_penalty_reason", "no-gpu-detected")
+
+    return tokens_per_sec 
 
 def estimate_max_ngl(llama_bench_path, model_path, min_ngl=0, max_ngl=SEARCH_SPACE['gpu_layers']['high']):
     """
@@ -120,24 +188,29 @@ def run_llama_bench_with_csv(cmd, metric):
     return metric_value
 
 
-def objective_1(trial, n_tokens, metric, repeat, llama_bench_path, model_path):
+def objective_1(trial, n_tokens, metric, repeat, llama_bench_path, model_path,
+                context_size: int = None):
     """
     Objective function for Optuna optimization. Samples a set of performance parameters,
     builds the llama-bench command, runs the benchmark, and returns the throughput metric.
 
     Parameters:
         trial (optuna.trial.Trial): The current Optuna trial object.
-        n_tokens (int): the number of tokens used in pp and tg benchmark 
+        n_tokens (int): the number of tokens used in pp and tg benchmark
         metric (str): The performance metric to optimize ("tg", "pp", or "mean").
         repeat (int): Number of llama-bench repetitions for every trial; used to calculate robust <token/s> value
+        context_size (int, optional): Context window size. When provided, constrains max batch size.
     Returns:
         float: The throughput value to maximize (tokens/sec).
     """
-    # Sample params
-    batch        = trial.suggest_int('batch', SEARCH_SPACE['batch_size']['low'], SEARCH_SPACE['batch_size']['high'])
+    # Sample params with context-aware batch constraint
+    batch_high = get_context_aware_batch_high(context_size)
+    batch        = trial.suggest_int('batch', SEARCH_SPACE['batch_size']['low'], batch_high)
     u_batch      = trial.suggest_int('u_batch', SEARCH_SPACE['ubatch_size']['low'], SEARCH_SPACE['ubatch_size']['high'])
     threads      = trial.suggest_int('threads', SEARCH_SPACE['threads']['low'], SEARCH_SPACE['threads']['high'])
     gpu_layers   = trial.suggest_int('gpu_layers', SEARCH_SPACE['gpu_layers']['low'], SEARCH_SPACE['gpu_layers']['high'])
+    cache_type   = trial.suggest_categorical('cache_type', SEARCH_SPACE['cache_type'])
+    mmap         = trial.suggest_categorical('mmap', SEARCH_SPACE['mmap'])
 
     # ----------  constraint check [under development/testing] -------------
     # llama.cpp usually requires batch_size >= ubatch_size; 
@@ -172,6 +245,14 @@ def objective_1(trial, n_tokens, metric, repeat, llama_bench_path, model_path):
     if metric in ("mean"):
         cmd_1 += ["-n", str(n_tokens), "-p", str(2*n_tokens)]  # tokens to generate and process 
 
+    # KV cache quantization (symmetric K+V)
+    if cache_type != 'f16':  # f16 is the default; skip flag to avoid redundancy
+        cmd_1 += ["-ctk", cache_type, "-ctv", cache_type]
+
+    # Memory mapping toggle (mmap=1 is default; add flag only for mmap=0)
+    if mmap == 0:
+        cmd_1 += ["-mmp", "0"]
+
     # debug
     print("")
     print(f"cmd_1: {cmd_1}")
@@ -187,19 +268,28 @@ def objective_1(trial, n_tokens, metric, repeat, llama_bench_path, model_path):
     # i.e. this trial will be considered a failure but not fatal.
 
 
-def objective_2(trial, n_tokens, metric, repeat, llama_bench_path, model_path, override_mode, batch, u_batch, threads, gpu_layers):
+def objective_2(trial, n_tokens, metric, repeat, llama_bench_path, model_path, override_mode, batch, u_batch, threads, gpu_layers,
+                context_size: int = None):
     """
     Objective function for Optuna scan over the entire categorical parameter space
 
     Extra parameters:
         override-tensor;
-        batch, u_batch, threads, gpu_layers: are all fixed (best parameters from initial Trials_1) 
+        batch, u_batch, threads, gpu_layers: are all fixed (best parameters from initial Trials_1)
+        context_size (int, optional): Context window size. When provided, validates batch against safe limit.
     
     Returns:
         float: The throughput value to maximize (tokens/sec).
     """
     # for debug
     print(f"Running objective_2 with batch={batch}, u_batch={u_batch}, threads={threads}, gpu_layers={gpu_layers}")
+
+    # Validate batch against context constraint
+    if context_size is not None:
+        max_safe_batch = get_context_aware_batch_high(context_size)
+        if batch > max_safe_batch:
+            print(f"  Warning: batch={batch} exceeds safe limit for context={context_size} "
+                  f"(max={max_safe_batch}). Trial may cause VRAM spike.")
 
 
     # Build llama-bench command (can edit to add more flags)
@@ -235,6 +325,16 @@ def objective_2(trial, n_tokens, metric, repeat, llama_bench_path, model_path, o
         if override_key != "none":  # in case of "none" option, do not pass the no --override-tensor flag 
             cmd_2 += ["--override-tensor", OVERRIDE_PATTERNS[override_key]]   
 
+    # KV cache quantization (symmetric K+V)
+    cache_type = trial.suggest_categorical('cache_type', SEARCH_SPACE['cache_type'])
+    if cache_type != 'f16':  # f16 is the default; skip flag to avoid redundancy
+        cmd_2 += ["-ctk", cache_type, "-ctv", cache_type]
+
+    # Memory mapping toggle
+    mmap = trial.suggest_categorical('mmap', SEARCH_SPACE['mmap'])
+    if mmap == 0:
+        cmd_2 += ["-mmp", "0"]
+
     # debug 
     print("")
     print(f"cmd_2: {cmd_2} ")
@@ -248,9 +348,10 @@ def objective_2(trial, n_tokens, metric, repeat, llama_bench_path, model_path, o
         return 0.0
 
 
-def objective_3(trial, n_tokens, metric, repeat, llama_bench_path, model_path, override_pattern, flash_attn, override_mode):
+def objective_3(trial, n_tokens, metric, repeat, llama_bench_path, model_path, override_pattern, flash_attn, override_mode,
+                context_size: int = None):
     """
-    Objective function for Optuna optimization. 
+    Objective function for Optuna optimization.
     After we select promising '--override-tensor' and '--flash-attn'
     estimated over favorable conditions (best par from first Trials loop)
     we now run again over the numerical parameter space
@@ -261,14 +362,18 @@ def objective_3(trial, n_tokens, metric, repeat, llama_bench_path, model_path, o
         repeat (int): Number of llama-bench repetitions for every trial; used to calculate robust <token/s> value
         override_tensor
         flash_attn
+        context_size (int, optional): Context window size. When provided, constrains max batch size.
     Returns:
         float: The throughput value to maximize (tokens/sec).
     """
-    # Sample params
-    batch        = trial.suggest_int('batch', SEARCH_SPACE['batch_size']['low'], SEARCH_SPACE['batch_size']['high'])
+    # Sample params with context-aware batch constraint
+    batch_high = get_context_aware_batch_high(context_size)
+    batch        = trial.suggest_int('batch', SEARCH_SPACE['batch_size']['low'], batch_high)
     u_batch      = trial.suggest_int('u_batch', SEARCH_SPACE['ubatch_size']['low'], SEARCH_SPACE['ubatch_size']['high'])
     threads      = trial.suggest_int('threads', SEARCH_SPACE['threads']['low'], SEARCH_SPACE['threads']['high'])
     gpu_layers   = trial.suggest_int('gpu_layers', SEARCH_SPACE['gpu_layers']['low'], SEARCH_SPACE['gpu_layers']['high'])
+    cache_type   = trial.suggest_categorical('cache_type', SEARCH_SPACE['cache_type'])
+    mmap         = trial.suggest_categorical('mmap', SEARCH_SPACE['mmap'])
 
     # Build llama-bench command 
     cmd_3 = [
@@ -289,7 +394,7 @@ def objective_3(trial, n_tokens, metric, repeat, llama_bench_path, model_path, o
     if metric in ("pp"):
         cmd_3 += ["-p", str(2*n_tokens), "-n", str(0)]  # tokens to process; Add "zero" to -n or -p to disable it.  
     if metric in ("mean"):
-        cmd_3 += ["-n", str(n_tokens), "-p", str(2*n_tokens)]  # tokens to generate and process 
+        cmd_3 += ["-n", str(n_tokens), "-p", str(2*n_tokens)]  # tokens to generate and process
 
 
     # remove flash-attn flag in case --flash-attn is 0 `
@@ -303,6 +408,14 @@ def objective_3(trial, n_tokens, metric, repeat, llama_bench_path, model_path, o
         override_key = trial.suggest_categorical('override_tensor', list(OVERRIDE_PATTERNS.keys()))
         if override_key != "none":  # in case of "none" option, do not pass the no --override-tensor flag 
             cmd_3 += ["--override-tensor", OVERRIDE_PATTERNS[override_key]]   
+
+    # KV cache quantization (symmetric K+V)
+    if cache_type != 'f16':  # f16 is the default; skip flag to avoid redundancy
+        cmd_3 += ["-ctk", cache_type, "-ctv", cache_type]
+
+    # Memory mapping toggle
+    if mmap == 0:
+        cmd_3 += ["-mmp", "0"]
 
     # debug
     print("")
@@ -362,23 +475,26 @@ def warmup_until_stable(llama_bench_path, model_path, metric, ngl, min_runs, n_w
     return history
 
 
-def run_optimization(n_trials, n_tokens, metric, repeat, llama_bench_path, model_path, llama_bin_path, override_mode):  
+def run_optimization(n_trials, n_tokens, metric, repeat, llama_bench_path, model_path, llama_bin_path, override_mode,
+                       *, vram_headroom_threshold=0.12, no_telemetry=False, context_size: int = None) -> dict:
     """
     Run the Optuna optimization loop for a given number of trials, using the provided metric.
     At the end, print the best configuration and ready-to-use commands for llama-server/llama-bench.
 
-    Given the large parameter space, the optimization runs in 3 stages. 
-    - Stage 1: over the numerical space: 'gpu_layers', 'threads', 'batch' and 'ubatch' 
+    Given the large parameter space, the optimization runs in 3 stages.
+    - Stage 1: over the numerical space: 'gpu_layers', 'threads', 'batch' and 'ubatch'
     - Stage 2: over the categorical space: 'override_tensor' and 'flash_attn'
-    - Stage 3: with the best of previous config, run again over the numerical space. 
+    - Stage 3: with the best of previous config, run again over the numerical space.
 
     Parameters:
         n_trials (int): Number of Optuna trials to perform. Default: 35.
         metric (str): Which throughput metric to optimize ("tg", "pp", or "mean"). Default: tg.
+        vram_headroom_threshold (float): Minimum VRAM headroom as fraction (default 0.12 = 12%).
+        no_telemetry (bool): Disable nvidia-smi telemetry (useful for non-NVIDIA GPUs or CI).
         ...[TBD]
 
     Returns:
-        None 
+        None
     """
 
     # outpus
@@ -387,12 +503,24 @@ def run_optimization(n_trials, n_tokens, metric, repeat, llama_bench_path, model
     print("# First stage: Initial exploration of parameter space      #")
     print("############################################################")
     print("")
+    _print_stage_estimate("Stage 1", n_trials)
 
     # TRIALS: FIRST STAGE
     sampler = TPESampler(multivariate=True)  # Others: "random": RandomSampler(); "cmaes": CmaEsSampler(),
     study_1 = optuna.create_study(direction="maximize", sampler=sampler)
-    # use lambda to inject metric, repeat ...  
-    study_1.optimize(lambda trial: objective_1(trial, n_tokens, metric, repeat, llama_bench_path, model_path), n_trials=n_trials)
+    # use lambda to inject metric, repeat ...
+    study_1.optimize(
+        lambda trial: _run_with_telemetry(
+            objective_1, trial,
+            vram_headroom_threshold=vram_headroom_threshold,
+            no_telemetry=no_telemetry,
+            n_tokens=n_tokens, metric=metric, repeat=repeat,
+            llama_bench_path=llama_bench_path, model_path=model_path,
+            context_size=context_size,
+        ),
+        n_trials=n_trials,
+        callbacks=[_progress_callback("Stage 1", n_trials)],
+    )
     print("")
     print("Best config Stage_1:", study_1.best_trial.params) 
     print(f"Best Stage_1 {metric} tokens/sec:", study_1.best_value)
@@ -410,24 +538,44 @@ def run_optimization(n_trials, n_tokens, metric, repeat, llama_bench_path, model
 
 
     # TRIALS: SECOND STAGE
-    if override_mode == "scan": 
-        n_override = len(OVERRIDE_PATTERNS)  # 
-        n_trials_2 = n_override * 2  # to cover all possibilities, since flash_attn: <0|1>
-        
+    if override_mode == "scan":
+        n_override = len(OVERRIDE_PATTERNS)
+        # Grid covers flash_attn (2) x override_tensor (n_override) x cache_type (len) x mmap (2)
+        n_trials_2 = 2 * n_override * len(SEARCH_SPACE['cache_type']) * len(SEARCH_SPACE['mmap'])
+
         # define grid space
         search2 = {'flash_attn': SEARCH_SPACE['flash_attn'],
-                   'override_tensor': SEARCH_SPACE['override_spc']}    
+                   'override_tensor': SEARCH_SPACE['override_spc'],
+                   'cache_type': SEARCH_SPACE['cache_type'],
+                   'mmap': SEARCH_SPACE['mmap']}
     else:
-        n_trials_2 = 2 # since flash_attn: <0|1> 
-        search2 = {'flash_attn': SEARCH_SPACE['flash_attn']} 
+        # Grid covers flash_attn (2) x cache_type (len) x mmap (2)
+        n_trials_2 = 2 * len(SEARCH_SPACE['cache_type']) * len(SEARCH_SPACE['mmap'])
+        search2 = {'flash_attn': SEARCH_SPACE['flash_attn'],
+                   'cache_type': SEARCH_SPACE['cache_type'],
+                   'mmap': SEARCH_SPACE['mmap']}
+
+    _print_stage_estimate("Stage 2", n_trials_2)
 
     # in this case, use grid sampler
     sampler_2 = optuna.samplers.GridSampler(search2)
     study_2 = optuna.create_study(direction="maximize", sampler=sampler_2)
-    # use lambda to inject metric, repeat ...  
-    study_2.optimize(lambda trial: objective_2(trial, n_tokens, metric, repeat, llama_bench_path, model_path, 
-                                               override_mode, best_1['batch'], best_1['u_batch'], 
-                                               best_1['threads'], best_1['gpu_layers']), n_trials=n_trials_2)
+    # use lambda to inject metric, repeat ...
+    study_2.optimize(
+        lambda trial: _run_with_telemetry(
+            objective_2, trial,
+            vram_headroom_threshold=vram_headroom_threshold,
+            no_telemetry=no_telemetry,
+            n_tokens=n_tokens, metric=metric, repeat=repeat,
+            llama_bench_path=llama_bench_path, model_path=model_path,
+            override_mode=override_mode,
+            batch=best_1['batch'], u_batch=best_1['u_batch'],
+            threads=best_1['threads'], gpu_layers=best_1['gpu_layers'],
+            context_size=context_size,
+        ),
+        n_trials=n_trials_2,
+        callbacks=[_progress_callback("Stage 2", n_trials_2)],
+    )
     print("")
     print("Best config Stage_2:", study_2.best_trial.params)
     print(f"Best Stage_2 {metric} tokens/sec:", study_2.best_value)
@@ -446,13 +594,27 @@ def run_optimization(n_trials, n_tokens, metric, repeat, llama_bench_path, model
     print("# Third stage: Finetune final config  #")
     print("#######################################")
     print("")
+    _print_stage_estimate("Stage 3", n_trials)
 
-    # TRIALS : THIRD STAGE 
+    # TRIALS : THIRD STAGE
     sampler_3 = TPESampler(multivariate=True)  # Others: "random": RandomSampler(); "cmaes": CmaEsSampler(),
     study_3 = optuna.create_study(direction="maximize", sampler=sampler_3)
-    # use lambda to inject metric, repeat ...  
-    study_3.optimize(lambda trial: objective_3(trial, n_tokens, metric, repeat, llama_bench_path, model_path, 
-                                               best_2['override_tensor'], best_2['flash_attn'], override_mode), n_trials=n_trials)
+    # use lambda to inject metric, repeat ...
+    study_3.optimize(
+        lambda trial: _run_with_telemetry(
+            objective_3, trial,
+            vram_headroom_threshold=vram_headroom_threshold,
+            no_telemetry=no_telemetry,
+            n_tokens=n_tokens, metric=metric, repeat=repeat,
+            llama_bench_path=llama_bench_path, model_path=model_path,
+            override_pattern=best_2['override_tensor'],
+            flash_attn=best_2['flash_attn'],
+            override_mode=override_mode,
+            context_size=context_size,
+        ),
+        n_trials=n_trials,
+        callbacks=[_progress_callback("Stage 3", n_trials)],
+    )
     print("")
     print("Best config Stage_3:", study_3.best_trial.params)
     print(f"Best Stage_3 {metric} tokens/sec:", study_3.best_value)
@@ -460,6 +622,24 @@ def run_optimization(n_trials, n_tokens, metric, repeat, llama_bench_path, model
 
     # Output: Best llama.cpp parameters from Stage 3 trials
     best_3 = study_3.best_trial.params
+
+    # Save best Phase 1 config to JSON for Phase 2 context tuning
+    from pathlib import Path
+    best_config = {
+        "gpu_layers": best_3["gpu_layers"],
+        "batch": best_3["batch"],
+        "u_batch": best_3["u_batch"],
+        "threads": best_3["threads"],
+        "mmap": best_3.get("mmap", 1),
+        "flash_attn": best_2.get("flash_attn", 0),
+        "override_tensor": best_2.get("override_tensor", "none"),
+        "cache_type": best_3.get("cache_type", "f16"),
+        "model_path": model_path,
+        "best_value": study_3.best_value,
+    }
+    config_path = Path("best_phase1_config.json")
+    config_path.write_text(json.dumps(best_config, indent=2))
+    print(f"\nBest Phase 1 config saved to {config_path}")
 
     ### END OF TRIALS ###
 
@@ -566,6 +746,6 @@ def run_optimization(n_trials, n_tokens, metric, repeat, llama_bench_path, model
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, llama_bench_cmd_default)
 
-    # [TBD] add % of improvement 
+    # [TBD] add % of improvement
 
-
+    return best_config

@@ -9,6 +9,9 @@ legacy_files/
 assets/logo_files
 temp/
 
+# Generated Phase 1 optimization config (auto-created by llama-optimus)
+best_phase1_config.json
+
 # macOS Finder metadata
 .DS_Store
 */.DS_Store
