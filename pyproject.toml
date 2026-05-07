@@ -14,7 +14,8 @@ license = { text = "MIT" }
 requires-python = ">=3.8"
 dependencies = [
   "optuna>=3.0",
-  "pandas"
+  "pandas",
+  "gguf>=0.10"
 ]
 keywords = ["llama.cpp", "optimization", "AI", "Optuna", "performance"]
 classifiers = [
@@ -30,10 +31,9 @@ Repository = "https://github.com/BrunoArsioli/llama-optimus"
 
 [project.scripts]
 llama-optimus = "llama_optimus.cli:main"
-
 [tool.setuptools]
 package-dir = {"" = "src"}
 
-
-
+[project.optional-dependencies]
+dev = ["pytest"]
 

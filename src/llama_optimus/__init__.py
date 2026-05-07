@@ -20,4 +20,6 @@ from .core import (
     run_optimization,
     SEARCH_SPACE,
 )
+from .model_info import ModelMetadata, get_model_metadata
+from .search_space import apply_model_constraints
 
